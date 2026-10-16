@@ -1,0 +1,105 @@
+name: Release
+
+# Se lanza desde scripts/release.sh del repo privado (o a mano en la pestaña Actions).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag del código fuente a publicar (ej. v0.2.0)"
+        required: true
+      notes:
+        description: "Notas de la versión (se muestran en la app)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: aracari-studios/aracari-rust-demo
+
+jobs:
+  # 1. Crea el release como pre-release: así /releases/latest sigue apuntando a la
+  #    versión anterior hasta que los instaladores y latest.json estén completos.
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --prerelease --title "Aracari Demo $TAG" --notes "${NOTES:-Versión $TAG}"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id)
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  # 2. Compila macOS (universal: Apple Silicon + Intel) y Windows en paralelo
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: windows-latest
+            args: ""
+            rust_targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Descargar código fuente (repo privado, deploy key de solo lectura)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+
+      - name: Compilar, firmar actualizaciones y subir al release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          releaseBody: ${{ inputs.notes }}
+          args: ${{ matrix.args }}
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  # 3. Con todo subido, se marca como versión estable más reciente
+  publish:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | tee assets.txt
+          grep -qx latest.json assets.txt || { echo "Falta latest.json"; exit 1; }
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease=false --latest
