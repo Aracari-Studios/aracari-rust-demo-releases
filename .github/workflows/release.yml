@@ -56,12 +56,13 @@ jobs:
             rust_targets: ""
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: Descargar código fuente (repo privado, deploy key de solo lectura)
+      - name: Descargar código fuente (repo privado, token fine-grained de solo lectura)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
           ref: ${{ inputs.tag }}
-          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
